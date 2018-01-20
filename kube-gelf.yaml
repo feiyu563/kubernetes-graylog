@@ -1,0 +1,221 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-gelf
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  annotations:
+    rbac.authorization.kubernetes.io/autoupdate: "true"
+  name: kube-gelf-metadata-filter
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - pods/exec
+  - namespaces
+  verbs: ["get", "list", "watch", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-gelf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-gelf-metadata-filter
+subjects:
+- kind: ServiceAccount
+  name: kube-gelf
+  namespace: kube-system
+---
+apiVersion: v1
+data:
+  GELF_HOST: graylog
+  GELF_PORT: "12201"
+  GELF_PROTOCOL: udp
+  fluent.conf: |
+    <match fluent.**>
+      @type null
+    </match>
+
+    <source>
+      @type systemd
+      tag systemd
+      path /var/log/journal
+      <storage>
+        @type local
+        persistent true
+        path /pos
+      </storage>
+      <entry>
+        field_map {"MESSAGE": "log", "_PID": ["process", "pid"], "_CMDLINE": "process", "_COMM": "cmd"}
+        fields_strip_underscores true
+        fields_lowercase true
+      </entry>
+      read_from_head true
+    </source>
+
+    <source>
+      @type tail
+      path /var/log/containers/*.log
+      pos_file /pos/containers.pos
+      time_key time
+      time_format %Y-%m-%dT%H:%M:%S.%NZ
+      tag kubernetes.*
+      format json
+      read_from_head true
+    </source>
+
+    <filter kubernetes.**>
+      @type kubernetes_metadata
+      ca_file /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file /var/run/secrets/kubernetes.io/serviceaccount/token
+    </filter>
+
+    <filter access>
+      @type record_transformer
+      <record>
+        hostname "#{ENV['NODENAME']}"
+      </record>
+    </filter>
+
+    <match **>
+       @type copy
+       <store>
+         @type gelf
+         include_tag_key true
+         host "#{ENV['GELF_HOST']}"
+         port "#{ENV['GELF_PORT']}"
+         # protocol <tcp or udp>
+         protocol "#{ENV['GELF_PROTOCOL']}"
+         # tls <true or false>
+         # tls_options {}
+         # Supported tls_options:
+         # 'no_default_ca' [Boolean] prevents OpenSSL from using the systems CA store.
+         # 'tls_version' [Symbol] any of :TLSv1, :TLSv1_1, :TLSv1_2 (default)
+         # 'cert' [String, IO] the client certificate file
+         # 'key' [String, IO] the key for the client certificate
+         # 'all_ciphers' [Boolean] allows any ciphers to be used, may be insecure
+         flush_interval 10s
+         num_threads 2
+         use_record_host true
+         buffer_chunk_limit 4096K
+         buffer_queue_limit 512
+         max_retry_wait 300
+       </store>
+    </match>
+
+    # Valid log_level's are: fatal, error, warn, info, debug, trace
+    <system>
+      log_level warn
+    </system>
+kind: ConfigMap
+metadata:
+  name: kube-gelf
+  namespace: kube-system
+---
+apiVersion: apps/v1beta2
+kind: DaemonSet
+metadata:
+  name: kube-gelf
+  namespace: kube-system
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: kube-gelf
+  template:
+    metadata:
+      labels:
+        app: kube-gelf
+    spec:
+      serviceAccountName: kube-gelf
+      dnsPolicy: ClusterFirst
+      containers:
+      - name: agent
+        image: roffe/kube-gelf:v1.2
+        env:
+        - name: TZ
+          value: "Asia/Shanghai"
+        - name: GELF_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: kube-gelf
+              key: GELF_HOST
+        - name: GELF_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: kube-gelf
+              key: GELF_PORT
+        - name: GELF_PROTOCOL
+          valueFrom:
+            configMapKeyRef:
+              name: kube-gelf
+              key: GELF_PROTOCOL
+        - name: NODENAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+          readOnly: true
+        - name: gelf-pos
+          mountPath: /pos
+          readOnly: false
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+        - name: kube-gelf-config
+          mountPath: /fluentd/etc/fluent.conf
+          subPath: fluent.conf
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: kube-gelf-config
+        configMap:
+          name: kube-gelf
+          items:
+          - key: fluent.conf
+            path: fluent.conf
+      - name: gelf-pos
+        hostPath:
+          path: /var/log/pos
+---
+apiVersion: batch/v1beta1
+kind: CronJob
+metadata:
+  name: kube-gelf-reload-config
+  namespace: kube-system
+spec:
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  schedule: "*/30 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: kube-gelf
+          containers:
+          - name: cron
+            image: roffe/kubectl:v1.9.0
+            args:
+            - /bin/sh
+            - -c
+            - for POD in `kubectl get pod --namespace kube-system -l app=kube-gelf | tail -n +2 | awk '{print $1}'`; do echo RELOAD ${POD}; kubectl exec --namespace kube-system ${POD} -- /bin/sh -c 'kill -1 1'; done
+          restartPolicy: Never

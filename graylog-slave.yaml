@@ -1,0 +1,100 @@
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: graylog-slave
+  namespace: kube-system
+spec:
+  serviceName: "graylog-slave"
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        role: graylog-slave
+        graylog: "true"
+    spec:
+      terminationGracePeriodSeconds: 20
+      affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                  - node1
+                  - node2
+                  - master1
+                  - master2
+                  - master3
+      containers:
+        - name: graylog-slave
+          image: graylog2/server:2.4.0-1
+          env:
+          - name: TZ
+            value: "Asia/Shanghai"
+          - name: GRAYLOG_PASSWORD_SECRET
+            value: "somepasswordpepper"
+          - name: GRAYLOG_ROOT_PASSWORD_SHA2
+            value: "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"
+          - name: GRAYLOG_MONGODB_URI
+            value: "mongodb://mongo-mongodb:27017/graylog"
+          - name: GRAYLOG_ROOT_TIMEZONE
+            value: "PRC"
+          - name: GRAYLOG_IS_MASTER
+            value: "false"
+          - name: GRAYLOG_ELASTICSEARCH_HOSTS
+            value: "http://elasticsearch:9200"
+          - name: GRAYLOG_WEB_ENDPOINT_URI
+            value: "http://172.16.20.2:31300/api"
+          - name: GRAYLOG_REST_LISTEN_URI
+            value: "http://0.0.0.0:9000/api/"
+          - name: GRAYLOG_WEB_LISTEN_URI
+            value: "http://0.0.0.0:9000/"
+          - name: GRAYLOG_REST_TRANSPORT_URI
+            value: "http://graylog-slave:9000/api/"
+          - name: GRAYLOG_SERVER_JAVA_OPTS
+            value: "-Xms1g -Xmx1g -XX:NewRatio=1 -XX:MaxMetaspaceSize=256m -server -XX:+ResizeTLAB -XX:+UseConcMarkSweepGC -XX:+CMSConcurrentMTEnabled -XX:+CMSClassUnloadingEnabled -XX:+UseParNewGC -XX:-OmitStackTraceInFastThrow"
+          ports:
+          - containerPort: 9000
+            name: http
+          - containerPort: 12201
+            name: udp-input
+          - containerPort: 1514
+            name: tcp-input
+          volumeMounts:
+          - name: graylog-persistent-storage
+            mountPath: /usr/share/graylog/data/journal
+            subPath: graylog
+          - name: varlog
+            mountPath: /var/log
+            readOnly: true
+          resources:
+            requests:
+              cpu: .25
+              memory: 1536Mi
+            limits:
+              cpu: 1.5
+              memory: 2048Mi
+          readinessProbe:
+            httpGet:
+              path: /api/system/lbstatus
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 3
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 2
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+  volumeClaimTemplates:
+  - metadata:
+      name: graylog-persistent-storage
+      annotations:
+        volume.beta.kubernetes.io/storage-class: "fast"
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi

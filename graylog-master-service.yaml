@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: graylog-master
+  namespace: kube-system
+  labels:
+    name: graylog-master
+spec:
+  selector:
+    role: graylog-master
+  ports:
+  - name: http
+    protocol: TCP
+    port: 9000
+  clusterIP: None
